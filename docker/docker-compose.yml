@@ -1,0 +1,176 @@
+version: "3.9"
+
+# ─── Smart City IoT Platform - Docker Compose ─────────────────────────────────
+# Run: docker compose up -d
+# Stop: docker compose down
+# Logs: docker compose logs -f
+
+networks:
+  smartcity-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  kafka_data:
+  zookeeper_data:
+
+services:
+
+  # ── Zookeeper ──────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: smartcity-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper
+    networks:
+      - smartcity-net
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Kafka Broker ──────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: smartcity-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_LOG_SEGMENT_BYTES: 104857600  # 100 MB
+      KAFKA_NUM_PARTITIONS: 3
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - smartcity-net
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # ── Kafka Topic Creator ───────────────────────────────────────────────────
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: smartcity-kafka-setup
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - smartcity-net
+    command: >
+      bash -c "
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic traffic_stream --partitions 3 --replication-factor 1 &&
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic air_quality_stream --partitions 3 --replication-factor 1 &&
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic weather_stream --partitions 2 --replication-factor 1 &&
+        echo 'Topics created successfully'
+      "
+
+  # ── Kafka UI ──────────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: smartcity-kafka-ui
+    depends_on:
+      - kafka
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: smart-city
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    networks:
+      - smartcity-net
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: smartcity-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: smartcity
+      POSTGRES_PASSWORD: smartcity
+      POSTGRES_DB: smartcity
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../db/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    networks:
+      - smartcity-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U smartcity -d smartcity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Python Simulators ─────────────────────────────────────────────────────
+  simulator:
+    build:
+      context: ../simulator
+      dockerfile: Dockerfile
+    container_name: smartcity-simulator
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+    networks:
+      - smartcity-net
+    restart: on-failure
+
+  # ── Go Backend ────────────────────────────────────────────────────────────
+  go-backend:
+    build:
+      context: ../go_backend
+      dockerfile: Dockerfile
+    container_name: smartcity-backend
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKERS: kafka:29092
+      DATABASE_URL: postgres://smartcity:smartcity@postgres:5432/smartcity?sslmode=disable
+      API_PORT: :8080
+      GIN_MODE: release
+    networks:
+      - smartcity-net
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── Streamlit Dashboard ───────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
+    container_name: smartcity-dashboard
+    depends_on:
+      go-backend:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    environment:
+      API_BASE: http://go-backend:8080/api/v1
+    networks:
+      - smartcity-net
+    restart: on-failure
